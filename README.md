@@ -80,19 +80,9 @@ npm run build              # Build for production
 - [Frontend](./packages/frontend/README.md)
 - [Architecture](./docs/ARCHITECTURE.md)
 
-## 🎪 Hackathon Scope (10 hours)
-
-MVP features:
-
-- ✅ Basic EventCoinHook with fee distribution
-- ✅ EventToken deployment
-- ✅ Pool initialization with liquidity
-- ✅ Simple frontend for buying $EVENT
-- ✅ Real-time payout tracking
-
 ## 🤝 Contributing
 
-This is a hackathon project. Feel free to fork and experiment!
+Feel free to fork and experiment!
 
 ## 📄 License
 
