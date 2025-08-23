@@ -1,0 +1,12 @@
+{
+  "name": "unifans",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "scripts": {
+    "dev": "npm run dev --workspace=frontend",
+    "build": "npm run build --workspace=contracts && npm run build --workspace=frontend",
+    "test": "npm run test --workspace=contracts",
+    "test:watch": "npm run test:watch --workspace=contracts"
+  }
+}
