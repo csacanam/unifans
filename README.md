@@ -6,10 +6,12 @@ Trustless crowdfunding for live events powered by Uniswap v4 hooks.
 ## 🚀 Quick Start
 
 ### Prerequisites
+
 - [Node.js](https://nodejs.org/) (v18+)
 - [Foundry](https://book.getfoundry.sh/getting-started/installation)
 
 ### Setup
+
 ```bash
 # Clone and install
 git clone <your-repo>
@@ -23,17 +25,19 @@ npm run build --workspace=contracts
 npm run dev --workspace=frontend
 ```
 
-## ��️ Project Structure
+## 📁 Project Structure
+
+```
 unifans/
 ├── packages/
-│ ├── contracts/ # Smart contracts (EventCoinHook, EventToken)
-│ ├── frontend/ # Next.js web app
-│ └── shared/ # Shared types & configs
-├── package.json # Workspace root
-└── README.md # This file
+│   ├── contracts/          # Smart contracts (EventCoinHook, EventToken)
+│   ├── frontend/           # Next.js web app
+│   └── shared/             # Shared types & configs
+├── package.json            # Workspace root
+└── README.md               # This file
+```
 
-
-## �� What is UniFans?
+## 💡 What is UniFans?
 
 UniFans converts each live event into a liquid digital asset:
 
@@ -45,6 +49,7 @@ UniFans converts each live event into a liquid digital asset:
 ## 🔧 Development
 
 ### Commands
+
 ```bash
 npm run build              # Build all packages
 npm run test               # Test contracts
@@ -53,6 +58,7 @@ npm run format             # Format Solidity code
 ```
 
 ### Smart Contracts
+
 ```bash
 cd packages/contracts
 forge build                # Build contracts
@@ -61,13 +67,14 @@ forge test --watch         # Watch mode
 ```
 
 ### Frontend
+
 ```bash
 cd packages/frontend
 npm run dev                # Start dev server
 npm run build              # Build for production
 ```
 
-## �� Documentation
+## 📚 Documentation
 
 - [Smart Contracts](./packages/contracts/README.md)
 - [Frontend](./packages/frontend/README.md)
@@ -76,13 +83,14 @@ npm run build              # Build for production
 ## 🎪 Hackathon Scope (10 hours)
 
 MVP features:
+
 - ✅ Basic EventCoinHook with fee distribution
 - ✅ EventToken deployment
 - ✅ Pool initialization with liquidity
 - ✅ Simple frontend for buying $EVENT
 - ✅ Real-time payout tracking
 
-## �� Contributing
+## 🤝 Contributing
 
 This is a hackathon project. Feel free to fork and experiment!
 
