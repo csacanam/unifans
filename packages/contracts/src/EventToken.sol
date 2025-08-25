@@ -22,6 +22,9 @@ contract EventToken is ERC20, Ownable {
     uint256 public immutable tokensPerSecond; // Tokens unlocked per second
     uint256 public organizerBalance; // Current balance of organizer (for tracking)
 
+    // Hook integration for one-sided liquidity
+    address public eventHook; // Address of the EventCoinHook contract
+
     // Events
     event OrganizerTransfer(
         address indexed from,
@@ -29,12 +32,14 @@ contract EventToken is ERC20, Ownable {
         uint256 amount,
         uint256 remainingBalance
     );
+    event HookSet(address indexed hook, uint256 tokensTransferred);
 
     // Errors
     error ExceedsTransferableAmount(uint256 requested, uint256 transferable);
     error OnlyOrganizer();
     error InvalidEventDate();
     error InvalidOrganizer();
+    error InvalidHook();
 
     /**
      * @dev Constructor to create a new event token
@@ -210,6 +215,24 @@ contract EventToken is ERC20, Ownable {
         uint256 totalVestingTime = eventDate - vestingStartTime;
 
         return (timeElapsed * 100) / totalVestingTime;
+    }
+
+    /**
+     * @dev Set the hook contract address and transfer ALL available tokens for one-sided liquidity
+     * @dev Can only be called by the owner (deployer), and only once
+     * @param _hook Address of the EventCoinHook contract
+     */
+    function setHook(address _hook) external onlyOwner {
+        require(_hook != address(0), "Invalid hook address");
+        require(eventHook == address(0), "Hook already set");
+
+        eventHook = _hook;
+
+        // Transfer ALL available tokens from contract to hook for one-sided liquidity
+        uint256 allTokens = balanceOf(address(this));
+        _transfer(address(this), _hook, allTokens);
+
+        emit HookSet(_hook, allTokens);
     }
 
     /**

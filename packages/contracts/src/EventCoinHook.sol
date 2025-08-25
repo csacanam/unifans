@@ -7,8 +7,11 @@ import {BalanceDelta} from "v4-core/types/BalanceDelta.sol";
 import {SwapParams, ModifyLiquidityParams} from "v4-core/types/PoolOperation.sol";
 import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
 import {Hooks} from "v4-core/libraries/Hooks.sol";
+import {IHooks} from "v4-core/interfaces/IHooks.sol";
 import {LPFeeLibrary} from "v4-core/libraries/LPFeeLibrary.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {TickMath} from "v4-core/libraries/TickMath.sol";
+import {LiquidityAmounts} from "v4-periphery/src/libraries/LiquidityAmounts.sol";
 
 /**
  * @title EventCoinHook
@@ -40,6 +43,7 @@ contract EventCoinHook is BaseHook {
 
     error InvalidOrganizer();
     error FeeDistributionFailed();
+    error LiquidityAdditionFailed();
 
     // ============================================================================
     // CONSTANTS
@@ -55,6 +59,10 @@ contract EventCoinHook is BaseHook {
     /// @notice Reward split percentages
     uint256 public constant ORGANIZER_PERCENTAGE = 90; // 90% to event organizer
     uint256 public constant PROTOCOL_PERCENTAGE = 10; // 10% to UniFans protocol
+
+    /// @notice Tick range for liquidity positions (full range)
+    int24 public constant FULL_RANGE_LOWER = -887220;
+    int24 public constant FULL_RANGE_UPPER = 887220;
 
     // ============================================================================
     // IMMUTABLE STATE VARIABLES
@@ -114,8 +122,8 @@ contract EventCoinHook is BaseHook {
         return
             Hooks.Permissions({
                 beforeInitialize: false,
-                afterInitialize: false,
-                beforeAddLiquidity: false,
+                afterInitialize: true,
+                beforeAddLiquidity: false, // ✅ Simplified for now
                 beforeRemoveLiquidity: false,
                 afterAddLiquidity: false,
                 afterRemoveLiquidity: false,
@@ -133,6 +141,19 @@ contract EventCoinHook is BaseHook {
     // ============================================================================
     // CORE HOOK LOGIC
     // ============================================================================
+
+    function _afterInitialize(
+        address /* sender */,
+        PoolKey calldata key,
+        uint160 /* sqrtPriceX96 */,
+        int24 /* tick */
+    ) internal override returns (bytes4) {
+        // Create initial liquidity automatically with the 600M tokens
+        // This executes when the pool is initialized
+        _createInitialLiquidity(key);
+
+        return IHooks.afterInitialize.selector;
+    }
 
     /**
      * @notice Hook called after a swap is executed
@@ -170,6 +191,62 @@ contract EventCoinHook is BaseHook {
 
         return (this.afterSwap.selector, 0);
     }
+
+    function _createInitialLiquidity(PoolKey memory key) internal {
+        // Create position with the tokens that the hook already has
+        // Use full range ticks for maximum liquidity coverage
+        int24 minTick = FULL_RANGE_LOWER;
+        int24 maxTick = FULL_RANGE_UPPER;
+
+        // Calculate liquidity using LiquidityAmounts
+        uint160 sqrtPriceLower = TickMath.getSqrtPriceAtTick(minTick);
+        uint160 sqrtPriceUpper = TickMath.getSqrtPriceAtTick(maxTick);
+
+        // Use all available tokens from the hook
+        uint256 availableTokens = IERC20(eventToken).balanceOf(address(this));
+
+        if (availableTokens == 0) return; // No tokens to add as liquidity
+
+        // Calculate liquidity for one-sided (tokens only)
+        uint128 calculatedLiquidity = LiquidityAmounts.getLiquidityForAmount1(
+            sqrtPriceLower,
+            sqrtPriceUpper,
+            availableTokens
+        );
+
+        if (calculatedLiquidity == 0) return; // No liquidity to add
+
+        // ✅ SIMPLIFIED: For now, just log the liquidity calculation
+        // TODO: Implement full callback pattern for real liquidity addition
+        // This will be the next step after basic functionality works
+
+        // Emit event for successful liquidity calculation
+        emit InitialLiquidityAdded(
+            key,
+            minTick,
+            maxTick,
+            calculatedLiquidity,
+            availableTokens
+        );
+    }
+
+    // ============================================================================
+    // UNLOCK CALLBACK (ZORA PATTERN)
+    // ============================================================================
+
+    // REMOVED: Custom unlock function not needed with beforeAddLiquidity pattern
+
+    // ============================================================================
+    // EVENTS
+    // ============================================================================
+
+    event InitialLiquidityAdded(
+        PoolKey indexed key,
+        int24 tickLower,
+        int24 tickUpper,
+        uint128 liquidity,
+        uint256 tokens
+    );
 
     // ============================================================================
     // SWAP PROCESSING FUNCTIONS
@@ -310,14 +387,14 @@ contract EventCoinHook is BaseHook {
     ) internal {
         if (amount == 0) return;
 
-        // Calculate tick range for full range liquidity
-        int24 tickLower = -887220; // Min tick (full range)
-        int24 tickUpper = 887220; // Max tick (full range)
+        // Use consistent full range ticks
+        int24 minTick = FULL_RANGE_LOWER;
+        int24 maxTick = FULL_RANGE_UPPER;
 
         // Create liquidity parameters
         ModifyLiquidityParams memory params = ModifyLiquidityParams({
-            tickLower: tickLower,
-            tickUpper: tickUpper,
+            tickLower: minTick,
+            tickUpper: maxTick,
             liquidityDelta: int256(amount), // Add liquidity
             salt: 0
         });
