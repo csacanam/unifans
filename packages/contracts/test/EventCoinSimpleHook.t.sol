@@ -476,4 +476,24 @@ contract EventCoinSimpleHookTest is Test, Deployers {
         console.log("--------------------------------------------");
         console.log("");
     }
+
+    // ============================================================================
+    // INTERNAL HELPER FUNCTIONS
+    // ============================================================================
+
+    /**
+     * @notice Helper to get current pool liquidity for assertions
+     * @return liquidity Current liquidity in the pool
+     */
+    function _getCurrentLiquidity() internal view returns (uint128 liquidity) {
+        return manager.getLiquidity(poolId);
+    }
+
+    /**
+     * @notice Helper to check if hook has sufficient tokens for bootstrap
+     * @return hasTokens True if hook has at least 600M event tokens
+     */
+    function _hookHasSufficientTokens() internal view returns (bool hasTokens) {
+        return eventToken.balanceOf(address(hook)) >= TOKEN_AMOUNT;
+    }
 }
