@@ -1,0 +1,746 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.26;
+
+import {BaseHook} from "v4-periphery/src/utils/BaseHook.sol";
+import {PoolKey} from "v4-core/types/PoolKey.sol";
+import {BalanceDelta} from "v4-core/types/BalanceDelta.sol";
+import {SwapParams, ModifyLiquidityParams} from "v4-core/types/PoolOperation.sol";
+import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
+import {Hooks} from "v4-core/libraries/Hooks.sol";
+import {IHooks} from "v4-core/interfaces/IHooks.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {TickMath} from "v4-core/libraries/TickMath.sol";
+import {LiquidityAmounts} from "v4-periphery/src/libraries/LiquidityAmounts.sol";
+import {Currency, CurrencyLibrary} from "v4-core/types/Currency.sol";
+import {CurrencySettler} from "v4-periphery/lib/v4-core/test/utils/CurrencySettler.sol";
+import {PoolId, PoolIdLibrary} from "v4-core/types/PoolId.sol";
+import {StateLibrary} from "v4-core/libraries/StateLibrary.sol";
+
+/**
+ * @title EventCoinHook
+ * @notice Uniswap V4 hook for UniFans - distributes fees to organizers and adds permanent liquidity
+ * @dev This hook implements the core UniFans tokenomics:
+ *      - Collects 3% fee from swaps in both directions (BACKING ↔ TOKEN)
+ *      - Distributes 40% to permanent liquidity (strengthens the pool)
+ *      - Distributes 60% to rewards (90% organizer + 10% protocol)
+ *      - All distributions happen immediately after each swap
+ *
+ * @dev Fee collection is asset-aware:
+ *      - BACKING → TOKEN swaps: fees collected in backing asset
+ *      - TOKEN → BACKING swaps: fees collected in tokens
+ *
+ * @dev This creates a sustainable model where:
+ *      - Organizers receive immediate funding
+ *      - Protocol earns sustainable revenue
+ *      - Pool maintains liquidity for secondary market
+ *
+ * @author @camilosaka
+ */
+contract EventCoinHook is BaseHook {
+    using CurrencyLibrary for Currency;
+    using CurrencySettler for Currency;
+    using PoolIdLibrary for PoolKey;
+    using StateLibrary for IPoolManager;
+
+    // ============================================================================
+    // CONSTANTS
+    // ============================================================================
+
+    /// @notice Fee percentage (3% = 300 basis points)
+    uint24 public constant FEE_BPS = 300;
+
+    /// @notice Distribution percentages for collected fees
+    uint256 public constant LIQUIDITY_PERCENTAGE = 40; // 40% to permanent liquidity
+    uint256 public constant REWARDS_PERCENTAGE = 60; // 60% to rewards distribution
+
+    /// @notice Reward split percentages
+    uint256 public constant ORGANIZER_PERCENTAGE = 90; // 90% to event organizer
+    uint256 public constant PROTOCOL_PERCENTAGE = 10; // 10% to UniFans protocol
+
+    /// @notice Tick range for liquidity positions (full range)
+    int24 public constant FULL_RANGE_LOWER = -887220;
+    int24 public constant FULL_RANGE_UPPER = 887220;
+
+    /// @notice Callback ID for adding initial liquidity
+    uint8 constant ADD_LIQUIDITY_CALLBACK_ID = 1;
+
+    // ============================================================================
+    // IMMUTABLE STATE VARIABLES
+    // ============================================================================
+
+    /// @notice Address of the event organizer who receives rewards
+    address public immutable eventOrganizer;
+
+    /// @notice Address of the event token (ERC20) being traded
+    address public immutable eventToken;
+
+    /// @notice Address of the UniFans protocol wallet
+    address public immutable protocolWallet;
+
+    /// @notice Address of the backing asset (ERC20) for the pool
+    address public immutable backingAsset;
+
+    /// @notice Amount of backing asset deposited by organizer for initial liquidity
+    uint256 public initialBackingAmount;
+
+    /// @notice Flag to track if organizer has deposited backing asset
+    bool public backingAssetDeposited;
+
+    /// @notice Thrown when trying to interact with a non-initialized pool
+    error PoolNotInitialized();
+
+    // ============================================================================
+    // STRUCTS
+    // ============================================================================
+
+    // ============================================================================
+    // ERRORS
+    // ============================================================================
+
+    error InvalidOrganizer();
+    error InvalidToken();
+    error InvalidProtocolWallet();
+    error InvalidBackingAsset();
+    error InvalidCallbackId(uint8 callbackId);
+    error CallbackNotFromPoolManager();
+    error OnlyOrganizer();
+    error WrongHookOnKey();
+    error Currency1MustBeEventToken();
+    error OnlyPoolManager();
+    error ZeroAmounts();
+    error BackingAssetAlreadyDeposited();
+    error NoBackingAssetDeposited();
+    error InsufficientEventTokens();
+
+    // ============================================================================
+    // MODIFIERS
+    // ============================================================================
+
+    /// @notice Ensures only the pool manager can call callback functions
+    modifier onlyPoolManagerCallback() {
+        if (msg.sender != address(poolManager)) {
+            revert CallbackNotFromPoolManager();
+        }
+        _;
+    }
+
+    /// @notice Ensures only the event organizer can call certain functions
+    modifier onlyOrganizer() {
+        if (msg.sender != eventOrganizer) revert OnlyOrganizer();
+        _;
+    }
+
+    // ============================================================================
+    // CONSTRUCTOR
+    // ============================================================================
+
+    /**
+     * @notice Initializes the EventCoinHook
+     * @param _manager The Uniswap V4 PoolManager address
+     * @param _eventOrganizer The address of the event organizer
+     * @param _eventToken The address of the event token
+     * @param _protocolWallet The address of the UniFans protocol walletc
+     * @param _backingAsset The address of the backing asset (ETH)
+     * @dev All addresses must be non-zero for security
+     */
+    constructor(
+        IPoolManager _manager,
+        address _eventOrganizer,
+        address _eventToken,
+        address _protocolWallet,
+        address _backingAsset
+    ) BaseHook(_manager) {
+        if (_eventOrganizer == address(0)) revert InvalidOrganizer();
+        if (_eventToken == address(0)) revert InvalidToken();
+        if (_protocolWallet == address(0)) revert InvalidProtocolWallet();
+        if (_backingAsset == address(0)) revert InvalidBackingAsset();
+
+        eventOrganizer = _eventOrganizer;
+        eventToken = _eventToken;
+        protocolWallet = _protocolWallet;
+        backingAsset = _backingAsset;
+    }
+
+    // ============================================================================
+    // HOOK PERMISSIONS
+    // ============================================================================
+
+    /**
+     * @notice Configure hook permissions for Uniswap V4
+     * @return permissions The hook permissions configuration
+     * @dev Only afterInitialize and afterSwap are enabled for this use case
+     */
+    function getHookPermissions()
+        public
+        pure
+        override
+        returns (Hooks.Permissions memory)
+    {
+        return
+            Hooks.Permissions({
+                beforeInitialize: false,
+                afterInitialize: true, // ✅ For initial liquidity calculation
+                beforeAddLiquidity: false,
+                beforeRemoveLiquidity: false,
+                afterAddLiquidity: false,
+                afterRemoveLiquidity: false,
+                beforeSwap: false,
+                afterSwap: true, // ✅ For fee collection and distribution
+                beforeDonate: false,
+                afterDonate: false,
+                beforeSwapReturnDelta: false,
+                afterSwapReturnDelta: false,
+                afterAddLiquidityReturnDelta: false,
+                afterRemoveLiquidityReturnDelta: false
+            });
+    }
+
+    // ============================================================================
+    // LIQUIDITY BOOTSTRAPPING
+    // ============================================================================
+
+    /**
+     * @notice Allows organizer to deposit backing asset for initial liquidity
+     * @dev This must be called before pool initialization to provide backing asset
+     * @param amount Amount of backing asset to deposit for initial liquidity
+     */
+    function depositBackingAsset(uint256 amount) external onlyOrganizer {
+        if (backingAssetDeposited) revert BackingAssetAlreadyDeposited();
+        if (amount == 0) revert ZeroAmounts();
+
+        // Transfer backing asset from organizer to this hook
+        // Organizer must have approved this amount to the hook
+        IERC20(backingAsset).transferFrom(msg.sender, address(this), amount);
+
+        initialBackingAmount = amount;
+        backingAssetDeposited = true;
+
+        emit BackingAssetDeposited(msg.sender, amount);
+    }
+
+    /**
+     * @notice Manual bootstrap initial liquidity (fallback if automatic failed)
+     * @dev Uses callback pattern to add liquidity with both backing asset and event tokens
+     * @dev Can only be called by organizer after depositing backing asset
+     * @dev Only needed if automatic bootstrap in afterInitialize didn't work
+     */
+    function bootstrapInitialLiquidity(
+        PoolKey calldata key
+    ) external onlyOrganizer {
+        if (!_canBootstrapLiquidity()) {
+            if (!backingAssetDeposited) revert NoBackingAssetDeposited();
+            if (
+                IERC20(eventToken).balanceOf(address(this)) < 600_000_000 ether
+            ) {
+                revert InsufficientEventTokens();
+            }
+        }
+
+        // Check if liquidity already exists (automatic bootstrap worked)
+        PoolId poolId = key.toId();
+        if (poolManager.getLiquidity(poolId) > 0) {
+            revert("Liquidity already bootstrapped");
+        }
+
+        _performBootstrap(key);
+    }
+
+    // ============================================================================
+    // CORE HOOK LOGIC
+    // ============================================================================
+
+    /**
+     * @notice Hook called after pool initialization
+     * @dev Automatically bootstraps initial liquidity if conditions are met
+     * @param key The pool key containing pool information
+     * @return selector The function selector for afterInitialize
+     */
+    function _afterInitialize(
+        address,
+        PoolKey calldata key,
+        uint160,
+        int24
+    ) internal override returns (bytes4) {
+        require(address(key.hooks) == address(this), "Wrong hook");
+
+        emit PoolInitialized(key);
+
+        // Check if we can automatically bootstrap liquidity
+        if (_canBootstrapLiquidity()) {
+            _performBootstrap(key);
+        }
+
+        return IHooks.afterInitialize.selector;
+    }
+
+    /**
+     * @notice Check if conditions are met for automatic liquidity bootstrapping
+     * @return bool True if bootstrap can proceed automatically
+     */
+    function _canBootstrapLiquidity() internal view returns (bool) {
+        return
+            backingAssetDeposited &&
+            IERC20(eventToken).balanceOf(address(this)) >= 600_000_000 ether;
+    }
+
+    /**
+     * @notice Internal function to perform the bootstrap operation
+     * @param key The pool key for the liquidity operation
+     */
+    function _performBootstrap(PoolKey calldata key) internal {
+        // Create callback data for liquidity addition
+        bytes memory data = abi.encode(
+            ADD_LIQUIDITY_CALLBACK_ID,
+            abi.encode(key, initialBackingAmount, 600_000_000 ether)
+        );
+
+        // Use PoolManager unlock pattern
+        poolManager.unlock(data);
+
+        emit LiquidityBootstrapped(
+            key,
+            initialBackingAmount,
+            600_000_000 ether
+        );
+    }
+
+    /**
+     * @notice Hook called after a swap is executed
+     * @dev This is the main function that implements UniFans tokenomics
+     * @dev Collects 3% fee and distributes according to the model:
+     *      - 40% → permanent liquidity (strengthens pool)
+     *      - 60% → rewards (90% organizer + 10% protocol)
+     *
+     * @param key The pool key containing pool information
+     * @param swapParams The swap parameters (direction, amounts)
+     * @param delta The balance delta showing what changed in the swap
+     * @return selector The function selector for afterSwap
+     * @return delta The balance delta (unused, returns 0)
+     */
+    function _afterSwap(
+        address,
+        PoolKey calldata key,
+        SwapParams calldata swapParams,
+        BalanceDelta delta,
+        bytes calldata
+    ) internal override returns (bytes4, int128) {
+        // Verify this pool contains our backing asset and event token
+        address currency0Addr = Currency.unwrap(key.currency0);
+        address currency1Addr = Currency.unwrap(key.currency1);
+
+        bool hasBackingAsset = (currency0Addr == backingAsset ||
+            currency1Addr == backingAsset);
+        bool hasEventToken = (currency0Addr == eventToken ||
+            currency1Addr == eventToken);
+
+        if (!hasBackingAsset || !hasEventToken) {
+            return (this.afterSwap.selector, 0);
+        }
+
+        // Determine which currency is which based on addresses
+        bool backingIsZero = (currency0Addr == backingAsset);
+
+        // Process swap based on direction and currency positions
+        if (swapParams.zeroForOne) {
+            if (backingIsZero) {
+                // BACKING → TOKEN (buying tokens with backing asset)
+                _processBuySwap(delta, key, true); // backing asset fees
+            } else {
+                // TOKEN → BACKING (selling tokens for backing asset)
+                _processSellSwap(delta, key, false); // token fees
+            }
+        } else {
+            if (backingIsZero) {
+                // TOKEN → BACKING (selling tokens for backing asset)
+                _processSellSwap(delta, key, false); // token fees
+            } else {
+                // BACKING → TOKEN (buying tokens with backing asset)
+                _processBuySwap(delta, key, true); // backing asset fees
+            }
+        }
+
+        return (this.afterSwap.selector, 0);
+    }
+
+    // ============================================================================
+    // CALLBACK PATTERN FOR LIQUIDITY ADDITION
+    // ============================================================================
+
+    /**
+     * @notice Callback function called by PoolManager during unlock operations
+     * @dev Handles liquidity addition using proper V4 settle/take pattern
+     * @param data Encoded callback data containing operation type and parameters
+     * @return result The result of the callback operation
+     */
+    function unlockCallback(
+        bytes calldata data
+    ) external onlyPoolManagerCallback returns (bytes memory) {
+        // Decode callback data to determine operation type
+        (uint8 callbackId, bytes memory contents) = abi.decode(
+            data,
+            (uint8, bytes)
+        );
+
+        if (callbackId == ADD_LIQUIDITY_CALLBACK_ID) {
+            return _handleBootstrapLiquidity(contents);
+        }
+
+        revert InvalidCallbackId(callbackId);
+    }
+
+    /**
+     * @notice Handles the bootstrap liquidity callback operation
+     * @dev Adds initial liquidity with both backing asset and event tokens
+     * @param contents Encoded liquidity parameters (PoolKey, backingAmount, tokenAmount)
+     * @return result Empty bytes on success
+     */
+    function _handleBootstrapLiquidity(
+        bytes memory contents
+    ) internal returns (bytes memory) {
+        // Decode liquidity data from callback
+        (PoolKey memory key, uint256 backingAmount, uint256 tokenAmount) = abi
+            .decode(contents, (PoolKey, uint256, uint256));
+
+        require(address(key.hooks) == address(this), "Wrong hook");
+        require(
+            Currency.unwrap(key.currency0) == backingAsset,
+            "currency0 must be backing asset"
+        );
+        require(
+            Currency.unwrap(key.currency1) == eventToken,
+            "currency1 must be event token"
+        );
+
+        // Calculate liquidity for full range
+        int24 tickLower = FULL_RANGE_LOWER;
+        int24 tickUpper = FULL_RANGE_UPPER;
+
+        uint160 sqrtPriceLower = TickMath.getSqrtPriceAtTick(tickLower);
+        uint160 sqrtPriceUpper = TickMath.getSqrtPriceAtTick(tickUpper);
+
+        // Calculate liquidity based on both amounts
+        uint128 liquidity = LiquidityAmounts.getLiquidityForAmounts(
+            TickMath.getSqrtPriceAtTick(0), // Current price (1:1 for simplicity)
+            sqrtPriceLower,
+            sqrtPriceUpper,
+            backingAmount,
+            tokenAmount
+        );
+
+        PoolId poolId = key.toId();
+        uint128 liqBefore = poolManager.getLiquidity(poolId);
+
+        // Add liquidity to the pool
+        (BalanceDelta delta, ) = poolManager.modifyLiquidity(
+            key,
+            ModifyLiquidityParams({
+                tickLower: tickLower,
+                tickUpper: tickUpper,
+                liquidityDelta: int256(uint256(liquidity)),
+                salt: 0
+            }),
+            ""
+        );
+
+        // Handle payments using settle pattern
+        uint256 pay0 = uint256(int256(-delta.amount0()));
+        uint256 pay1 = uint256(int256(-delta.amount1()));
+
+        if (pay0 > 0) {
+            key.currency0.settle(poolManager, address(this), pay0, false);
+        }
+
+        if (pay1 > 0) {
+            key.currency1.settle(poolManager, address(this), pay1, false);
+        }
+
+        uint128 liqAfter = poolManager.getLiquidity(poolId);
+
+        emit InitialLiquidityAdded(
+            key,
+            tickLower,
+            tickUpper,
+            liquidity,
+            pay0,
+            pay1,
+            liqBefore,
+            liqAfter
+        );
+
+        return bytes("");
+    }
+
+    // ============================================================================
+    // SWAP PROCESSING FUNCTIONS
+    // ============================================================================
+
+    /**
+     * @notice Process BACKING → TOKEN swap (buying tokens)
+     * @dev Collects fees in backing asset and distributes according to tokenomics
+     * @param delta The balance delta from the swap
+     * @param key The pool key for liquidity operations
+     * @param collectBackingFees Whether to collect fees in backing asset (true) or tokens (false)
+     */
+    function _processBuySwap(
+        BalanceDelta delta,
+        PoolKey calldata key,
+        bool collectBackingFees
+    ) internal {
+        if (collectBackingFees) {
+            // Calculate backing asset spent (negative delta for amount0 or amount1)
+            uint256 backingSpent = uint256(int256(-delta.amount0()));
+            uint256 backingFees = (backingSpent * FEE_BPS) / 10000;
+
+            if (backingFees > 0) {
+                _distributeBackingFees(backingFees, key);
+            }
+        } else {
+            // Calculate tokens received (positive delta for amount1 or amount0)
+            uint256 tokensReceived = uint256(int256(delta.amount1()));
+            uint256 tokenFees = (tokensReceived * FEE_BPS) / 10000;
+
+            if (tokenFees > 0) {
+                _distributeTokenFees(tokenFees, key);
+            }
+        }
+    }
+
+    /**
+     * @notice Process TOKEN → BACKING swap (selling tokens)
+     * @dev Collects fees in tokens or backing asset depending on currency positions
+     * @param delta The balance delta from the swap
+     * @param key The pool key for liquidity operations
+     * @param collectBackingFees Whether to collect fees in backing asset (true) or tokens (false)
+     */
+    function _processSellSwap(
+        BalanceDelta delta,
+        PoolKey calldata key,
+        bool collectBackingFees
+    ) internal {
+        if (collectBackingFees) {
+            // Calculate backing asset received (positive delta)
+            uint256 backingReceived = uint256(int256(delta.amount0()));
+            uint256 backingFees = (backingReceived * FEE_BPS) / 10000;
+
+            if (backingFees > 0) {
+                _distributeBackingFees(backingFees, key);
+            }
+        } else {
+            // Calculate tokens sold (negative delta)
+            uint256 tokensSold = uint256(int256(-delta.amount1()));
+            uint256 tokenFees = (tokensSold * FEE_BPS) / 10000;
+
+            if (tokenFees > 0) {
+                _distributeTokenFees(tokenFees, key);
+            }
+        }
+    }
+
+    // ============================================================================
+    // FEE DISTRIBUTION FUNCTIONS
+    // ============================================================================
+
+    /**
+     * @notice Distributes backing asset fees according to UniFans tokenomics
+     * @dev In V4, fees are handled through PoolManager take/settle pattern
+     * @dev For now, simplified: fees stay in pool as additional liquidity
+     * @param totalFees Total backing asset fees collected from the swap
+     * @param key The pool key for liquidity operations
+     */
+    function _distributeBackingFees(
+        uint256 totalFees,
+        PoolKey calldata key
+    ) internal {
+        // TODO: Implement proper V4 fee distribution using take/settle pattern
+        // For now, fees effectively stay as additional liquidity in the pool
+
+        // In a proper implementation, this would:
+        // 1. Use poolManager.take() to extract fees
+        // 2. Use unlock() callback to distribute to organizer/protocol
+        // 3. Use settle() to handle any remaining balances
+
+        // Emit event for tracking
+        emit FeesCollected(totalFees, "backing_asset");
+    }
+
+    /**
+     * @notice Distributes token fees according to UniFans tokenomics
+     * @dev In V4, fees are handled through PoolManager take/settle pattern
+     * @dev For now, simplified: fees stay in pool as additional liquidity
+     * @param totalFees Total token fees collected from the swap
+     * @param key The pool key for liquidity operations
+     */
+    function _distributeTokenFees(
+        uint256 totalFees,
+        PoolKey calldata key
+    ) internal {
+        // TODO: Implement proper V4 fee distribution using take/settle pattern
+        // For now, fees effectively stay as additional liquidity in the pool
+
+        // Emit event for tracking
+        emit FeesCollected(totalFees, "event_token");
+    }
+
+    // ============================================================================
+    // REWARDS DISTRIBUTION FUNCTIONS
+    // ============================================================================
+
+    /**
+     * @notice Distributes ETH rewards: 90% to organizer, 10% to protocol
+     * @dev Both distributions happen immediately after each swap
+     * @param totalRewards Total ETH rewards to distribute
+     */
+    function _distributeETHRewards(uint256 totalRewards) internal {
+        // 90% to event organizer (immediate payment)
+        uint256 organizerAmount = (totalRewards * ORGANIZER_PERCENTAGE) / 100;
+        _transferETHToOrganizer(organizerAmount);
+
+        // 10% to UniFans protocol (immediate payment)
+        uint256 protocolAmount = (totalRewards * PROTOCOL_PERCENTAGE) / 100;
+        _transferETHToProtocol(protocolAmount);
+    }
+
+    /**
+     * @notice Distributes TOKEN rewards: 90% to organizer, 10% to protocol
+     * @dev Both distributions happen immediately after each swap
+     * @param totalRewards Total TOKEN rewards to distribute
+     */
+    function _distributeTokenRewards(uint256 totalRewards) internal {
+        // 90% to event organizer (immediate payment)
+        uint256 organizerAmount = (totalRewards * ORGANIZER_PERCENTAGE) / 100;
+        _transferTokensToOrganizer(organizerAmount);
+
+        // 10% to UniFans protocol (immediate payment)
+        uint256 protocolAmount = (totalRewards * PROTOCOL_PERCENTAGE) / 100;
+        _transferTokensToProtocol(protocolAmount);
+    }
+
+    // ============================================================================
+    // LIQUIDITY MANAGEMENT
+    // ============================================================================
+
+    /**
+     * @notice Adds permanent liquidity to the pool from fee collection
+     * @dev This strengthens the pool and ensures market depth for secondary trading
+     * @dev For now, just transfers fees to organizer/protocol (simplified approach)
+     * @param amount Amount that would be added as permanent liquidity
+     * @param key The pool key for liquidity operations
+     */
+    function _addPermanentLiquidity(
+        uint256 amount,
+        PoolKey calldata key
+    ) internal {
+        if (amount == 0) return;
+
+        // TODO: Implement proper callback pattern for permanent liquidity
+        // For now, just distribute as additional rewards to strengthen incentives
+
+        // 50% to organizer, 50% to protocol (alternative distribution)
+        uint256 halfAmount = amount / 2;
+
+        // Determine which currency we're dealing with
+        if (key.currency0.isAddressZero()) {
+            // ETH fees
+            _transferETHToOrganizer(halfAmount);
+            _transferETHToProtocol(halfAmount);
+        } else {
+            // Token fees
+            _transferTokensToOrganizer(halfAmount);
+            _transferTokensToProtocol(halfAmount);
+        }
+    }
+
+    // ============================================================================
+    // TRANSFER FUNCTIONS
+    // ============================================================================
+
+    /**
+     * @notice Transfers ETH to the event organizer
+     * @dev Uses low-level call for ETH transfers
+     * @param amount Amount of ETH to transfer
+     */
+    function _transferETHToOrganizer(uint256 amount) internal {
+        if (amount == 0) return;
+
+        (bool success, ) = eventOrganizer.call{value: amount}("");
+        if (!success) revert("Fee distribution failed");
+    }
+
+    /**
+     * @notice Transfers ETH to the protocol wallet
+     * @dev Uses low-level call for ETH transfers
+     * @param amount Amount of ETH to transfer
+     */
+    function _transferETHToProtocol(uint256 amount) internal {
+        if (amount == 0) return;
+
+        (bool success, ) = protocolWallet.call{value: amount}("");
+        if (!success) revert("Fee distribution failed");
+    }
+
+    /**
+     * @notice Transfers TOKENS to the event organizer
+     * @dev Uses IERC20 transfer for token transfers
+     * @param amount Amount of tokens to transfer
+     */
+    function _transferTokensToOrganizer(uint256 amount) internal {
+        if (amount == 0) return;
+
+        bool success = IERC20(eventToken).transfer(eventOrganizer, amount);
+        if (!success) revert("Fee distribution failed");
+    }
+
+    /**
+     * @notice Transfers TOKENS to the protocol wallet
+     * @dev Uses IERC20 transfer for token transfers
+     * @param amount Amount of tokens to transfer
+     */
+    function _transferTokensToProtocol(uint256 amount) internal {
+        if (amount == 0) return;
+
+        bool success = IERC20(eventToken).transfer(protocolWallet, amount);
+        if (!success) revert("Fee distribution failed");
+    }
+
+    // ============================================================================
+    // EVENTS
+    // ============================================================================
+
+    /// @notice Emitted when organizer deposits backing asset
+    event BackingAssetDeposited(address indexed organizer, uint256 amount);
+
+    /// @notice Emitted when pool is initialized and ready for liquidity
+    event PoolInitialized(PoolKey indexed key);
+
+    /// @notice Emitted when initial liquidity is successfully bootstrapped
+    event LiquidityBootstrapped(
+        PoolKey indexed key,
+        uint256 backingAmount,
+        uint256 tokenAmount
+    );
+
+    /// @notice Emitted when initial liquidity is added to the pool
+    event InitialLiquidityAdded(
+        PoolKey indexed key,
+        int24 tickLower,
+        int24 tickUpper,
+        uint128 liquidity,
+        uint256 backingAmount,
+        uint256 tokenAmount,
+        uint128 poolLiquidityBefore,
+        uint128 poolLiquidityAfter
+    );
+
+    /// @notice Emitted when fees are collected (for tracking purposes)
+    event FeesCollected(uint256 amount, string assetType);
+
+    // ============================================================================
+    // FALLBACK FUNCTIONS
+    // ============================================================================
+
+    /**
+     * @notice Allows the contract to receive ETH
+     * @dev Required for ETH transfers to work properly
+     */
+    receive() external payable {}
+}
