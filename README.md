@@ -58,6 +58,7 @@ UniFans converts each live event into a liquid digital asset with **continuous v
 ## 🔧 Smart Contracts
 
 ### EventCoinHook.sol
+
 - **Uniswap V4 Hook** that intercepts all swaps
 - **3% fee collection** on both buy (ETH→TOKEN) and sell (TOKEN→ETH) directions
 - **Asset-aware fees**: ETH fees for buys, TOKEN fees for sells
@@ -65,6 +66,7 @@ UniFans converts each live event into a liquid digital asset with **continuous v
 - **Real liquidity addition** via `poolManager.modifyLiquidity`
 
 ### EventToken.sol
+
 - **ERC20 token** with continuous vesting per second
 - **40% tokens** (400M) for organizer with vesting until event date
 - **60% tokens** (600M) for contract (initial liquidity pool)

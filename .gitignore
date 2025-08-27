@@ -147,6 +147,12 @@ coverage/
 *.tar.gz
 *.rar
 
+# Zora Protocol - Exclude completely
+zora-protocol/
+
+# Dopler Protocol - Exclude completely
+doppler/
+
 # Lock files (keep package-lock.json, but ignore others)
 yarn.lock
 pnpm-lock.yaml
