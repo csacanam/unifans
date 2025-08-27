@@ -2,7 +2,7 @@
 pragma solidity 0.8.26;
 
 // ============================================================================
-// UNISWAP V4 IMPORTS
+// UNISWAP V4 CORE IMPORTS
 // ============================================================================
 import {BaseHook} from "v4-periphery/src/utils/BaseHook.sol";
 import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
@@ -13,40 +13,50 @@ import {PoolId, PoolIdLibrary} from "v4-core/types/PoolId.sol";
 import {Currency, CurrencyLibrary} from "v4-core/types/Currency.sol";
 import {BalanceDelta} from "v4-core/types/BalanceDelta.sol";
 import {ModifyLiquidityParams} from "v4-core/types/PoolOperation.sol";
-import {TickMath} from "v4-core/libraries/TickMath.sol";
-import {LiquidityAmounts} from "v4-periphery/src/libraries/LiquidityAmounts.sol";
-import {CurrencySettler} from "v4-periphery/lib/v4-core/test/utils/CurrencySettler.sol";
-import {StateLibrary} from "v4-core/libraries/StateLibrary.sol";
 
 // ============================================================================
-// EXTERNAL IMPORTS
+// UNISWAP V4 LIBRARIES
 // ============================================================================
-import {IERC20} from "forge-std/interfaces/IERC20.sol";
+import {TickMath} from "v4-core/libraries/TickMath.sol";
+import {StateLibrary} from "v4-core/libraries/StateLibrary.sol";
+import {LiquidityAmounts} from "v4-periphery/src/libraries/LiquidityAmounts.sol";
+import {CurrencySettler} from "v4-periphery/lib/v4-core/test/utils/CurrencySettler.sol";
+
+// ============================================================================
+// EXTERNAL DEPENDENCIES
+// ============================================================================
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 /**
  * @title EventCoinSimpleHook
  * @notice Simplified Uniswap V4 hook for UniFans event token liquidity bootstrapping
- * @dev This is a streamlined version of the full EventCoinHook that focuses exclusively
- *      on initial liquidity bootstrapping. It provides automatic liquidity addition when
- *      pools are initialized, ensuring that event tokens have immediate tradability.
+ * @dev This streamlined version focuses exclusively on initial liquidity provision,
+ *      providing automatic two-sided liquidity when pools are initialized.
  *
- * Key Features:
- * - Automatic liquidity bootstrapping after pool initialization
- * - Two-sided liquidity provision (backing asset + event tokens)
- * - Full-range liquidity positions for maximum trading efficiency
- * - Secure organizer-only deposit mechanism
- * - Fallback manual bootstrap for edge cases
+ * ## Key Features
+ * - ✅ Automatic liquidity bootstrapping after pool initialization
+ * - ✅ Two-sided liquidity provision (backing asset + event tokens)
+ * - ✅ Full-range liquidity positions for maximum trading efficiency
+ * - ✅ Secure organizer-only deposit mechanism with single-use protection
+ * - ✅ Fallback manual bootstrap for edge cases
+ * - ✅ Generic backing asset support (any ERC20 with metadata)
  *
- * Excluded Features (available in full EventCoinHook):
- * - Swap fee collection and distribution
- * - Continuous liquidity growth from trading fees
- * - Advanced tokenomics and reward mechanisms
+ * ## Architecture
+ * This contract implements the Uniswap V4 hook pattern with `afterInitialize`
+ * permission to automatically add liquidity when pools are created. It uses
+ * the standard unlock/callback pattern for atomic operations.
  *
- * @dev This contract implements the Uniswap V4 hook pattern with afterInitialize
- *      permission to automatically add liquidity when pools are created.
+ * ## Flow
+ * 1. Event organizer deposits backing asset via `depositBackingAsset()`
+ * 2. Event tokens are transferred to hook (600M tokens)
+ * 3. Pool initialization triggers automatic bootstrap via `afterInitialize`
+ * 4. Hook adds full-range liquidity using both assets
+ * 5. Pool is ready for trading with established price
  *
  * @author UniFans Protocol Team
- * @custom:version 1.0.0
+ * @custom:version 2.0.0 - Generic backing asset support
  * @custom:security-contact security@unifans.io
  */
 contract EventCoinSimpleHook is BaseHook {
@@ -54,6 +64,7 @@ contract EventCoinSimpleHook is BaseHook {
     using CurrencySettler for Currency;
     using PoolIdLibrary for PoolKey;
     using StateLibrary for IPoolManager;
+    using SafeERC20 for IERC20;
 
     // ============================================================================
     // CONSTANTS
@@ -69,7 +80,7 @@ contract EventCoinSimpleHook is BaseHook {
 
     /// @notice Callback identifier for liquidity addition operations
     /// @dev Used to route callback data to the correct handler function
-    uint8 constant ADD_LIQUIDITY_CALLBACK_ID = 1;
+    uint8 private constant ADD_LIQUIDITY_CALLBACK_ID = 1;
 
     /// @notice Fixed token amount for initial liquidity (600M tokens)
     /// @dev This represents 60% of total token supply allocated to initial liquidity
@@ -91,6 +102,14 @@ contract EventCoinSimpleHook is BaseHook {
     /// @dev Typically USDC or another stable asset providing price stability
     address public immutable backingAsset;
 
+    /// @notice Number of decimals for the backing asset
+    /// @dev Cached at deployment for gas efficiency in calculations
+    uint8 public immutable backingAssetDecimals;
+
+    // ============================================================================
+    // MUTABLE STATE VARIABLES
+    // ============================================================================
+
     /// @notice Amount of backing asset deposited by organizer for initial liquidity
     /// @dev This value is set when organizer calls depositBackingAsset()
     uint256 public initialBackingAmount;
@@ -100,7 +119,7 @@ contract EventCoinSimpleHook is BaseHook {
     bool public backingAssetDeposited;
 
     // ============================================================================
-    // ERRORS
+    // CUSTOM ERRORS
     // ============================================================================
 
     /// @notice Thrown when organizer address is zero during construction
@@ -111,6 +130,9 @@ contract EventCoinSimpleHook is BaseHook {
 
     /// @notice Thrown when backing asset address is zero during construction
     error InvalidBackingAsset();
+
+    /// @notice Thrown when backing asset doesn't implement IERC20Metadata
+    error BackingAssetNotERC20Metadata();
 
     /// @notice Thrown when an unknown callback ID is received
     /// @param callbackId The invalid callback identifier that was provided
@@ -135,7 +157,7 @@ contract EventCoinSimpleHook is BaseHook {
     error InsufficientEventTokens();
 
     // ============================================================================
-    // MODIFIERS
+    // ACCESS CONTROL MODIFIERS
     // ============================================================================
 
     /// @notice Ensures only the pool manager can call callback functions
@@ -157,12 +179,12 @@ contract EventCoinSimpleHook is BaseHook {
     // ============================================================================
 
     /**
-     * @notice Initializes the EventCoinSimpleHook
+     * @notice Initializes the EventCoinSimpleHook with generic backing asset support
      * @param _manager The Uniswap V4 PoolManager address
      * @param _eventOrganizer The address of the event organizer
      * @param _eventToken The address of the event token
-     * @param _backingAsset The address of the backing asset (ERC20)
-     * @dev All addresses must be non-zero for security
+     * @param _backingAsset The address of the backing asset (must implement IERC20Metadata)
+     * @dev All addresses must be non-zero for security. Backing asset decimals are cached.
      */
     constructor(
         IPoolManager _manager,
@@ -170,23 +192,32 @@ contract EventCoinSimpleHook is BaseHook {
         address _eventToken,
         address _backingAsset
     ) BaseHook(_manager) {
+        // Validate constructor parameters
         if (_eventOrganizer == address(0)) revert InvalidOrganizer();
         if (_eventToken == address(0)) revert InvalidToken();
         if (_backingAsset == address(0)) revert InvalidBackingAsset();
 
+        // Validate backing asset implements IERC20Metadata
+        try IERC20Metadata(_backingAsset).decimals() returns (uint8 decimals) {
+            backingAssetDecimals = decimals;
+        } catch {
+            revert BackingAssetNotERC20Metadata();
+        }
+
+        // Set immutable state variables
         eventOrganizer = _eventOrganizer;
         eventToken = _eventToken;
         backingAsset = _backingAsset;
     }
 
     // ============================================================================
-    // HOOK PERMISSIONS
+    // HOOK PERMISSIONS CONFIGURATION
     // ============================================================================
 
     /**
      * @notice Configure hook permissions for Uniswap V4
      * @return permissions The hook permissions configuration
-     * @dev Only afterInitialize is enabled - no swap processing
+     * @dev Only afterInitialize is enabled - no swap processing in simple version
      */
     function getHookPermissions()
         public
@@ -214,7 +245,7 @@ contract EventCoinSimpleHook is BaseHook {
     }
 
     // ============================================================================
-    // LIQUIDITY BOOTSTRAPPING
+    // PUBLIC ORGANIZER FUNCTIONS
     // ============================================================================
 
     /**
@@ -222,26 +253,37 @@ contract EventCoinSimpleHook is BaseHook {
      * @dev This function must be called before pool initialization to enable automatic
      *      bootstrap. The organizer must approve this contract to spend the backing asset.
      *
-     * Requirements:
+     * ## Requirements
      * - Only callable by the designated event organizer
      * - Amount must be greater than zero
      * - Can only be called once per hook deployment
      * - Organizer must have sufficient backing asset balance
      * - Organizer must have approved this contract for the deposit amount
      *
+     * ## Process
+     * 1. Validates caller is organizer and amount > 0
+     * 2. Checks backing asset hasn't been deposited before
+     * 3. Transfers backing asset from organizer to hook using SafeERC20
+     * 4. Sets deposit flag to prevent double deposits
+     * 5. Emits BackingAssetDeposited event
+     *
      * @param amount The amount of backing asset to deposit (in backing asset decimals)
      *
-     * Emits:
-     * - BackingAssetDeposited event with organizer address and amount
+     * @custom:emits BackingAssetDeposited
      */
     function depositBackingAsset(uint256 amount) external onlyOrganizer {
         if (backingAssetDeposited) revert BackingAssetAlreadyDeposited();
         if (amount == 0) revert ZeroAmounts();
 
         // Transfer backing asset from organizer to this hook
-        // Organizer must have approved this amount to the hook
-        IERC20(backingAsset).transferFrom(msg.sender, address(this), amount);
+        // Using SafeERC20 for enhanced security
+        IERC20(backingAsset).safeTransferFrom(
+            msg.sender,
+            address(this),
+            amount
+        );
 
+        // Update state
         initialBackingAmount = amount;
         backingAssetDeposited = true;
 
@@ -253,18 +295,22 @@ contract EventCoinSimpleHook is BaseHook {
      * @dev This function serves as a fallback if automatic bootstrapping in afterInitialize
      *      fails for any reason. It uses the same callback pattern as automatic bootstrap.
      *
-     * Requirements:
+     * ## Requirements
      * - Only callable by the designated event organizer
      * - Backing asset must have been deposited previously
      * - Hook must have sufficient event tokens (600M tokens)
      * - Pool must not already have liquidity
      * - Pool must be initialized
      *
+     * ## Use Cases
+     * - Automatic bootstrap failed due to gas limits
+     * - Pool was initialized before backing asset deposit
+     * - Recovery from edge cases during deployment
+     *
      * @param key The pool key identifying the target pool for liquidity addition
      *
-     * Emits:
-     * - LiquidityBootstrapped event with pool key and amounts
-     * - InitialLiquidityAdded event with detailed liquidity information
+     * @custom:emits LiquidityBootstrapped
+     * @custom:emits InitialLiquidityAdded
      */
     function bootstrapInitialLiquidity(
         PoolKey calldata key
@@ -274,6 +320,8 @@ contract EventCoinSimpleHook is BaseHook {
         if (poolManager.getLiquidity(poolId) > 0) {
             revert("Liquidity already bootstrapped");
         }
+
+        // Validate bootstrap prerequisites
         if (!_canBootstrapLiquidity()) {
             if (!backingAssetDeposited) revert NoBackingAssetDeposited();
             if (
@@ -288,7 +336,7 @@ contract EventCoinSimpleHook is BaseHook {
     }
 
     // ============================================================================
-    // CORE HOOK LOGIC
+    // HOOK LIFECYCLE FUNCTIONS
     // ============================================================================
 
     /**
@@ -296,18 +344,24 @@ contract EventCoinSimpleHook is BaseHook {
      * @dev This is the core function that enables automatic liquidity bootstrapping.
      *      It's called by the Uniswap V4 PoolManager immediately after pool initialization.
      *
-     * Automatic Bootstrap Conditions:
+     * ## Automatic Bootstrap Conditions
      * - Organizer has deposited backing asset via depositBackingAsset()
      * - Hook contract has at least 600M event tokens
      * - Pool being initialized uses this hook
      *
+     * ## Process Flow
+     * 1. Validates the pool uses this hook
+     * 2. Emits PoolInitialized event
+     * 3. Checks if bootstrap conditions are met
+     * 4. If conditions met, triggers automatic bootstrap
+     * 5. Returns success selector
+     *
      * @param key The pool key containing currency addresses, fee, and hook information
      * @return selector The function selector confirming successful execution
      *
-     * Emits:
-     * - PoolInitialized event when pool is ready
-     * - LiquidityBootstrapped event if automatic bootstrap succeeds
-     * - InitialLiquidityAdded event with liquidity details
+     * @custom:emits PoolInitialized
+     * @custom:emits LiquidityBootstrapped (if bootstrap succeeds)
+     * @custom:emits InitialLiquidityAdded (if bootstrap succeeds)
      */
     function _afterInitialize(
         address,
@@ -327,11 +381,81 @@ contract EventCoinSimpleHook is BaseHook {
         return IHooks.afterInitialize.selector;
     }
 
+    // ============================================================================
+    // CALLBACK PATTERN IMPLEMENTATION
+    // ============================================================================
+
+    /**
+     * @notice Callback function executed by PoolManager during unlock operations
+     * @dev This function implements the Uniswap V4 callback pattern for atomic operations.
+     *      It's called by PoolManager.unlock() and handles the actual liquidity addition.
+     *
+     * ## Security Features
+     * - Only callable by the PoolManager contract
+     * - Validates callback ID to route to correct handler
+     * - All operations are atomic within the unlock context
+     *
+     * ## Supported Operations
+     * - ADD_LIQUIDITY_CALLBACK_ID: Initial liquidity addition
+     *
+     * @param data ABI-encoded callback data containing:
+     *             - uint8 callbackId: Operation identifier
+     *             - bytes contents: Operation-specific parameters
+     * @return result Empty bytes on successful execution
+     *
+     * @custom:security Only callable by PoolManager
+     */
+    function unlockCallback(
+        bytes calldata data
+    ) external onlyPoolManagerCallback returns (bytes memory) {
+        // Decode callback data to determine operation type
+        (uint8 callbackId, bytes memory contents) = abi.decode(
+            data,
+            (uint8, bytes)
+        );
+
+        if (callbackId == ADD_LIQUIDITY_CALLBACK_ID) {
+            return _handleBootstrapLiquidity(contents);
+        }
+
+        revert InvalidCallbackId(callbackId);
+    }
+
+    // ============================================================================
+    // VIEW FUNCTIONS
+    // ============================================================================
+
+    /**
+     * @notice Get backing asset information including cached decimals
+     * @return asset The backing asset address
+     * @return decimals The number of decimals for the backing asset
+     * @return symbol The symbol of the backing asset
+     */
+    function getBackingAssetInfo()
+        external
+        view
+        returns (address asset, uint8 decimals, string memory symbol)
+    {
+        asset = backingAsset;
+        decimals = backingAssetDecimals;
+        try IERC20Metadata(backingAsset).symbol() returns (
+            string memory _symbol
+        ) {
+            symbol = _symbol;
+        } catch {
+            symbol = "UNKNOWN";
+        }
+    }
+
+    // ============================================================================
+    // INTERNAL BOOTSTRAP LOGIC
+    // ============================================================================
+
     /**
      * @notice Internal function to check if automatic liquidity bootstrap can proceed
      * @dev Validates that all prerequisites for liquidity addition are satisfied
      *
-     * Bootstrap Prerequisites:
+     * ## Bootstrap Prerequisites
      * - Organizer has deposited backing asset (backingAssetDeposited = true)
      * - Hook contract has sufficient event tokens (≥ 600M tokens)
      *
@@ -348,7 +472,7 @@ contract EventCoinSimpleHook is BaseHook {
      * @dev Initiates the Uniswap V4 unlock/callback pattern to add initial liquidity.
      *      This function prepares callback data and triggers the PoolManager unlock.
      *
-     * Process Flow:
+     * ## Process Flow
      * 1. Encode callback data with operation ID and liquidity parameters
      * 2. Call PoolManager.unlock() to begin atomic operation
      * 3. PoolManager calls back to unlockCallback() with encoded data
@@ -357,8 +481,7 @@ contract EventCoinSimpleHook is BaseHook {
      *
      * @param key The pool key identifying the target pool
      *
-     * Emits:
-     * - LiquidityBootstrapped event with bootstrap parameters
+     * @custom:emits LiquidityBootstrapped
      */
     function _performBootstrap(PoolKey calldata key) internal {
         // Create callback data for liquidity addition
@@ -377,49 +500,12 @@ contract EventCoinSimpleHook is BaseHook {
         );
     }
 
-    // ============================================================================
-    // CALLBACK PATTERN FOR LIQUIDITY ADDITION
-    // ============================================================================
-
-    /**
-     * @notice Callback function executed by PoolManager during unlock operations
-     * @dev This function implements the Uniswap V4 callback pattern for atomic operations.
-     *      It's called by PoolManager.unlock() and handles the actual liquidity addition.
-     *
-     * Security:
-     * - Only callable by the PoolManager contract
-     * - Validates callback ID to route to correct handler
-     * - All operations are atomic within the unlock context
-     *
-     * @param data ABI-encoded callback data containing:
-     *             - uint8 callbackId: Operation identifier
-     *             - bytes contents: Operation-specific parameters
-     * @return result Empty bytes on successful execution
-     *
-     * @dev Reverts with InvalidCallbackId if unknown operation is requested
-     */
-    function unlockCallback(
-        bytes calldata data
-    ) external onlyPoolManagerCallback returns (bytes memory) {
-        // Decode callback data to determine operation type
-        (uint8 callbackId, bytes memory contents) = abi.decode(
-            data,
-            (uint8, bytes)
-        );
-
-        if (callbackId == ADD_LIQUIDITY_CALLBACK_ID) {
-            return _handleBootstrapLiquidity(contents);
-        }
-
-        revert InvalidCallbackId(callbackId);
-    }
-
     /**
      * @notice Internal callback handler for initial liquidity addition
      * @dev This function performs the actual liquidity addition using Uniswap V4 primitives.
      *      It calculates optimal liquidity amounts and settles payments atomically.
      *
-     * Liquidity Addition Process:
+     * ## Liquidity Addition Process
      * 1. Decode and validate callback parameters
      * 2. Verify pool contains both required currencies
      * 3. Calculate liquidity amount using current price and full-range ticks
@@ -433,8 +519,7 @@ contract EventCoinSimpleHook is BaseHook {
      *                 - uint256 tokenAmount: Amount of event tokens to use
      * @return result Empty bytes indicating successful completion
      *
-     * Emits:
-     * - InitialLiquidityAdded event with comprehensive liquidity details
+     * @custom:emits InitialLiquidityAdded
      */
     function _handleBootstrapLiquidity(
         bytes memory contents
@@ -457,10 +542,11 @@ contract EventCoinSimpleHook is BaseHook {
         require(hasBackingAsset, "Pool must contain backing asset");
         require(hasEventToken, "Pool must contain event token");
 
-        // Simplified approach to avoid stack too deep
+        // Get current pool price for liquidity calculations
         (uint160 sqrtP, , , ) = poolManager.getSlot0(key.toId());
 
-        uint128 L = LiquidityAmounts.getLiquidityForAmounts(
+        // Calculate liquidity using current price and amounts
+        uint128 liquidity = LiquidityAmounts.getLiquidityForAmounts(
             sqrtP,
             TickMath.getSqrtPriceAtTick(FULL_RANGE_LOWER),
             TickMath.getSqrtPriceAtTick(FULL_RANGE_UPPER),
@@ -473,21 +559,18 @@ contract EventCoinSimpleHook is BaseHook {
         );
 
         // Add liquidity to the pool using calculated amounts
-
         (BalanceDelta delta, ) = poolManager.modifyLiquidity(
             key,
             ModifyLiquidityParams({
                 tickLower: FULL_RANGE_LOWER,
                 tickUpper: FULL_RANGE_UPPER,
-                liquidityDelta: int256(uint256(L)),
+                liquidityDelta: int256(uint256(liquidity)),
                 salt: 0
             }),
             ""
         );
 
-        // Process the liquidity delta results
-
-        // Handle payments using settle pattern (simplified)
+        // Handle payments using settle pattern
         if (delta.amount0() < 0) {
             key.currency0.settle(
                 poolManager,
@@ -510,11 +593,11 @@ contract EventCoinSimpleHook is BaseHook {
             key,
             FULL_RANGE_LOWER,
             FULL_RANGE_UPPER,
-            L,
+            liquidity,
             delta.amount0() < 0 ? uint256(uint128(-delta.amount0())) : 0,
             delta.amount1() < 0 ? uint256(uint128(-delta.amount1())) : 0,
-            0, // liqBefore simplified
-            L // liqAfter simplified
+            0, // liqBefore (simplified for this version)
+            liquidity // liqAfter
         );
 
         return bytes("");
